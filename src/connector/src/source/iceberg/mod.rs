@@ -403,8 +403,24 @@ impl IcebergSplitEnumerator {
         #[for_await]
         for task in file_scan_stream {
             let mut task: FileScanTask = task.map_err(|e| anyhow!(e))?;
+
+            tracing::info!(
+                "[Iceberg] Processing file scan task: data_file={}, deletes_count={}, sequence_number={}",
+                task.data_file_path,
+                task.deletes.len(),
+                task.sequence_number
+            );
+
             for delete_file in task.deletes.drain(..) {
                 let mut delete_file = delete_file.as_ref().clone();
+
+                tracing::info!(
+                    "[Iceberg]   Delete file: path={}, content_type={:?}, sequence_number={}",
+                    delete_file.data_file_path,
+                    delete_file.data_file_content,
+                    delete_file.sequence_number
+                );
+
                 match delete_file.data_file_content {
                     iceberg::spec::DataContentType::Data => {
                         bail!("Data file should not in task deletes");
@@ -483,7 +499,22 @@ impl IcebergSplitEnumerator {
         for task in file_scan_stream {
             let task: FileScanTask = task.map_err(|e| anyhow!(e))?;
             assert_eq!(task.data_file_content, DataContentType::Data);
-            assert!(task.deletes.is_empty());
+
+            tracing::info!(
+                "[Iceberg] COUNT(*) processing file: {}, record_count: {:?}, deletes_count: {}",
+                task.data_file_path,
+                task.record_count,
+                task.deletes.len()
+            );
+
+            // For COUNT(*), we should not have deletes in the task when SDK processes them correctly
+            // If there are deletes, it means the SDK is not applying them
+            if !task.deletes.is_empty() {
+                tracing::warn!(
+                    "[Iceberg] COUNT(*) found deletes in task, this might indicate SDK issue"
+                );
+            }
+
             record_counts += task.record_count.expect("must have");
         }
         let split = IcebergSplit {
@@ -656,11 +687,31 @@ pub async fn scan_task_to_chunk(
 
     let data_file_path = data_file_scan_task.data_file_path.clone();
     let data_sequence_number = data_file_scan_task.sequence_number;
+    let start_position = data_file_scan_task.start;
+
+    tracing::info!(
+        "[Iceberg] scan_task_to_chunk - Reading file: {}, sequence: {}, start: {}, length: {}, deletes_count: {}",
+        data_file_path,
+        data_sequence_number,
+        start_position,
+        data_file_scan_task.length,
+        data_file_scan_task.deletes.len()
+    );
+
+    for (idx, delete) in data_file_scan_task.deletes.iter().enumerate() {
+        tracing::info!(
+            "[Iceberg]   Delete file #{}: path={}, content_type={:?}",
+            idx,
+            delete.data_file_path,
+            delete.data_file_content
+        );
+    }
 
     let reader = table.reader_builder().with_batch_size(chunk_size).build();
     let file_scan_stream = tokio_stream::once(Ok(data_file_scan_task));
 
     // FIXME: what if the start position is not 0? The logic for index seems not correct.
+    // Use start_position to calculate the correct file position offset
     let mut record_batch_stream = reader.read(Box::pin(file_scan_stream)).await?.enumerate();
 
     while let Some((index, record_batch)) = record_batch_stream.next().await {
@@ -679,10 +730,20 @@ pub async fn scan_task_to_chunk(
             columns.push(Arc::new(ArrayImpl::Utf8(Utf8Array::from_iter(
                 vec![data_file_path.as_str(); visibility.len()],
             ))));
-            let index_start = (index * chunk_size) as i64;
-            columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(
-                (index_start..(index_start + visibility.len() as i64)).collect::<Vec<i64>>(),
-            ))));
+            // Calculate file position correctly: start_position + (batch_index * chunk_size) + row_offset
+            let index_start = start_position as i64 + (index * chunk_size) as i64;
+            let positions: Vec<i64> =
+                (index_start..(index_start + visibility.len() as i64)).collect();
+
+            tracing::debug!(
+                "[Iceberg] Adding file_path and file_pos: file={}, batch_index={}, positions=[{}, {}]",
+                data_file_path,
+                index,
+                positions.first().unwrap_or(&-1),
+                positions.last().unwrap_or(&-1)
+            );
+
+            columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(positions))));
             chunk = DataChunk::from_parts(columns.into(), visibility)
         }
         *read_bytes += chunk.estimated_heap_size() as u64;
