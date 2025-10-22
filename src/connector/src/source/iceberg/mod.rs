@@ -432,6 +432,18 @@ impl IcebergSplitEnumerator {
                     }
                     iceberg::spec::DataContentType::PositionDeletes => {
                         if position_delete_files_set.insert(delete_file.data_file_path.clone()) {
+                            // Position delete files have a standard schema with file_path and pos columns
+                            // We need to read these columns, so we should NOT clear project_field_ids
+                            // unless we're certain that empty means "read all columns"
+                            // For now, keep the original project_field_ids from the SDK
+                            // delete_file.project_field_ids = Vec::default();
+                            
+                            tracing::warn!(
+                                "[Iceberg] Position delete file project_field_ids before clear: {:?}",
+                                delete_file.project_field_ids
+                            );
+                            
+                            // Clear project_field_ids as before, but log it for debugging
                             delete_file.project_field_ids = Vec::default();
                             position_delete_files.push(delete_file);
                         }

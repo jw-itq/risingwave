@@ -1,0 +1,37 @@
+================================================================================
+RisingWave Iceberg Position Delete Bug - 执行摘要
+================================================================================
+
+问题：查询Iceberg表返回主键重复数据，数量=更新次数+1
+
+根因：file_pos计算缺少start_position偏移量，导致anti-join无法匹配
+
+修复：添加start_position到file_pos计算公式
+
+位置：src/connector/src/source/iceberg/mod.rs:746
+
+修改前：let index_start = (index * chunk_size) as i64;
+修复后：let index_start = start_position as i64 + (index * chunk_size) as i64;
+
+信心度：90%+（明确的bug，有FIXME注释，符合所有现象）
+
+验证：
+1. ./risedev b && ./risedev d
+2. 查询测试数据：SELECT COUNT(*) FROM test_iceberg_source WHERE id=1684971
+3. 查看日志：tail -500 .risingwave/log/*.log | grep "\[Iceberg\]"
+
+预期：返回1条记录，file_pos不全是0
+
+文档：
+- FINAL_SUMMARY.md - 完整技术分析
+- COMPREHENSIVE_FIX_SUMMARY.md - 详细修复说明  
+- QUICK_VERIFICATION_CHECKLIST.md - 快速验证指南
+- FINAL_ROOT_CAUSE_ANALYSIS.md - 根因分析报告
+
+辅助文件（可选）：
+- reproduce_iceberg_duplicate_keys.sql - 复现脚本
+- ICEBERG_POSITION_DELETE_BUG_ANALYSIS.md - 图解分析
+- test_position_delete_fix.sh - 自动化测试
+
+下一步：立即测试，提供反馈
+================================================================================
