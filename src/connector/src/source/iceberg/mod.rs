@@ -30,7 +30,7 @@ use iceberg::table::Table;
 use itertools::Itertools;
 pub use parquet_file_handler::*;
 use phf::{Set, phf_set};
-use risingwave_common::array::arrow::IcebergArrowConvert;
+use risingwave_common::array::arrow::{IcebergArrowConvert, arrow_array, arrow_schema};
 use risingwave_common::array::{ArrayImpl, DataChunk, I64Array, Utf8Array};
 use risingwave_common::bail;
 use risingwave_common::catalog::{
@@ -727,40 +727,62 @@ pub async fn scan_task_to_chunk(
     let mut record_batch_stream = reader.read(Box::pin(file_scan_stream)).await?.enumerate();
 
     while let Some((index, record_batch)) = record_batch_stream.next().await {
-        let record_batch = record_batch?;
+        let mut record_batch = record_batch?;
 
-        // Log Position Delete file content for debugging
-        if data_file_path.contains("delete") && index == 0 {
-            tracing::warn!(
-                "[Iceberg] POSITION DELETE RecordBatch: file={}, num_rows={}, num_columns={}, schema={:?}",
-                data_file_path,
-                record_batch.num_rows(),
-                record_batch.num_columns(),
-                record_batch.schema()
-            );
+        // CRITICAL FIX for Position Delete files:
+        // Iceberg Position Delete files have standard column names "file_path" and "pos",
+        // but RisingWave expects "_iceberg_file_path" and "_iceberg_file_pos" for JOIN matching.
+        // We need to rename these columns to match RisingWave's internal naming convention.
+        //
+        // Detection: Position Delete files typically have "-delete" in their filename (Amoro convention)
+        // and contain exactly 2 columns: file_path (Utf8) and pos (Int64).
+        if data_file_path.contains("-delete") && record_batch.num_columns() == 2 {
+            let schema = record_batch.schema();
+            let fields = schema.fields();
+            
+            // Check if this matches Position Delete schema: file_path (String) + pos (i64)
+            if fields.len() == 2 {
+                let first_field = &fields[0];
+                let second_field = &fields[1];
+                
+                if (first_field.name() == "file_path" || first_field.name() == "file")
+                    && matches!(first_field.data_type(), arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8)
+                    && second_field.name() == "pos"
+                    && matches!(second_field.data_type(), arrow_schema::DataType::Int64)
+                {
+                    // Rename columns to RisingWave's internal names
+                    let new_fields = vec![
+                        arrow_schema::Field::new(
+                            ICEBERG_FILE_PATH_COLUMN_NAME,
+                            first_field.data_type().clone(),
+                            first_field.is_nullable(),
+                        ),
+                        arrow_schema::Field::new(
+                            ICEBERG_FILE_POS_COLUMN_NAME,
+                            second_field.data_type().clone(),
+                            second_field.is_nullable(),
+                        ),
+                    ];
+                    let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
+                    
+                    // Reconstruct RecordBatch with new schema but same data
+                    record_batch = arrow_array::RecordBatch::try_new(
+                        new_schema,
+                        record_batch.columns().to_vec(),
+                    )?;
+                    
+                    tracing::info!(
+                        "[Iceberg] Renamed Position Delete columns: {} -> {}, {} -> {}",
+                        first_field.name(),
+                        ICEBERG_FILE_PATH_COLUMN_NAME,
+                        second_field.name(),
+                        ICEBERG_FILE_POS_COLUMN_NAME
+                    );
+                }
+            }
         }
 
         let mut chunk = IcebergArrowConvert.chunk_from_record_batch(&record_batch)?;
-        
-        // Log Position Delete chunk content for debugging
-        if data_file_path.contains("delete") && index == 0 && chunk.cardinality() > 0 {
-            tracing::warn!(
-                "[Iceberg] POSITION DELETE Chunk: file={}, cardinality={}, num_columns={}, columns={:?}",
-                data_file_path,
-                chunk.cardinality(),
-                chunk.columns().len(),
-                chunk.columns().iter().map(|c| format!("{:?}", c.data_type())).collect::<Vec<_>>()
-            );
-            // Log first row data
-            if chunk.columns().len() >= 2 {
-                tracing::warn!(
-                    "[Iceberg] POSITION DELETE First row sample: col0_type={:?}, col1_type={:?}",
-                    chunk.columns()[0].data_type(),
-                    chunk.columns()[1].data_type()
-                );
-            }
-        }
-        
         if need_seq_num {
             let (mut columns, visibility) = chunk.into_parts();
             columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(
@@ -787,16 +809,6 @@ pub async fn scan_task_to_chunk(
                 positions.first().unwrap_or(&-1),
                 positions.last().unwrap_or(&-1)
             );
-
-            // Log first few position delete entries for debugging
-            if data_file_path.contains("delete") && index == 0 && visibility.len() > 0 {
-                tracing::warn!(
-                    "[Iceberg] POSITION DELETE DATA: file={}, first_pos={}, count={}",
-                    data_file_path,
-                    positions.first().unwrap_or(&-1),
-                    visibility.len()
-                );
-            }
 
             columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(positions))));
             chunk = DataChunk::from_parts(columns.into(), visibility)
