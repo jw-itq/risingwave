@@ -729,7 +729,38 @@ pub async fn scan_task_to_chunk(
     while let Some((index, record_batch)) = record_batch_stream.next().await {
         let record_batch = record_batch?;
 
+        // Log Position Delete file content for debugging
+        if data_file_path.contains("delete") && index == 0 {
+            tracing::warn!(
+                "[Iceberg] POSITION DELETE RecordBatch: file={}, num_rows={}, num_columns={}, schema={:?}",
+                data_file_path,
+                record_batch.num_rows(),
+                record_batch.num_columns(),
+                record_batch.schema()
+            );
+        }
+
         let mut chunk = IcebergArrowConvert.chunk_from_record_batch(&record_batch)?;
+        
+        // Log Position Delete chunk content for debugging
+        if data_file_path.contains("delete") && index == 0 && chunk.cardinality() > 0 {
+            tracing::warn!(
+                "[Iceberg] POSITION DELETE Chunk: file={}, cardinality={}, num_columns={}, columns={:?}",
+                data_file_path,
+                chunk.cardinality(),
+                chunk.columns().len(),
+                chunk.columns().iter().map(|c| format!("{:?}", c.data_type())).collect::<Vec<_>>()
+            );
+            // Log first row data
+            if chunk.columns().len() >= 2 {
+                tracing::warn!(
+                    "[Iceberg] POSITION DELETE First row sample: col0_type={:?}, col1_type={:?}",
+                    chunk.columns()[0].data_type(),
+                    chunk.columns()[1].data_type()
+                );
+            }
+        }
+        
         if need_seq_num {
             let (mut columns, visibility) = chunk.into_parts();
             columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(
@@ -748,12 +779,24 @@ pub async fn scan_task_to_chunk(
                 (index_start..(index_start + visibility.len() as i64)).collect();
 
             tracing::debug!(
-                "[Iceberg] Adding file_path and file_pos: file={}, batch_index={}, positions=[{}, {}]",
+                "[Iceberg] Adding file_path and file_pos: file={}, batch_index={}, start_position={}, chunk_size={}, positions=[{}, {}]",
                 data_file_path,
                 index,
+                start_position,
+                chunk_size,
                 positions.first().unwrap_or(&-1),
                 positions.last().unwrap_or(&-1)
             );
+
+            // Log first few position delete entries for debugging
+            if data_file_path.contains("delete") && index == 0 && visibility.len() > 0 {
+                tracing::warn!(
+                    "[Iceberg] POSITION DELETE DATA: file={}, first_pos={}, count={}",
+                    data_file_path,
+                    positions.first().unwrap_or(&-1),
+                    visibility.len()
+                );
+            }
 
             columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(positions))));
             chunk = DataChunk::from_parts(columns.into(), visibility)
