@@ -91,13 +91,27 @@ impl IcebergScanExecutor {
         let table = self.iceberg_config.load_table().await?;
         let data_types = self.schema.data_types();
 
-        let data_file_scan_tasks = match Option::take(&mut self.file_scan_tasks) {
-            Some(IcebergFileScanTask::Data(data_file_scan_tasks)) => data_file_scan_tasks,
+        let (scan_type, data_file_scan_tasks) = match Option::take(&mut self.file_scan_tasks) {
+            Some(IcebergFileScanTask::Data(data_file_scan_tasks)) => {
+                tracing::info!(
+                    "[Iceberg] Executing DataScan with {} files",
+                    data_file_scan_tasks.len()
+                );
+                ("DataScan", data_file_scan_tasks)
+            }
             Some(IcebergFileScanTask::EqualityDelete(equality_delete_file_scan_tasks)) => {
-                equality_delete_file_scan_tasks
+                tracing::info!(
+                    "[Iceberg] Executing EqualityDeleteScan with {} files",
+                    equality_delete_file_scan_tasks.len()
+                );
+                ("EqualityDeleteScan", equality_delete_file_scan_tasks)
             }
             Some(IcebergFileScanTask::PositionDelete(position_delete_file_scan_tasks)) => {
-                position_delete_file_scan_tasks
+                tracing::info!(
+                    "[Iceberg] Executing PositionDeleteScan with {} files",
+                    position_delete_file_scan_tasks.len()
+                );
+                ("PositionDeleteScan", position_delete_file_scan_tasks)
             }
             Some(IcebergFileScanTask::CountStar(_)) => {
                 bail!("iceberg scan executor does not support count star")
@@ -107,7 +121,8 @@ impl IcebergScanExecutor {
             }
         };
 
-        for data_file_scan_task in data_file_scan_tasks {
+        for (task_idx, data_file_scan_task) in data_file_scan_tasks.into_iter().enumerate() {
+            tracing::debug!("[Iceberg] {} - Processing task #{}", scan_type, task_idx);
             #[for_await]
             for chunk in scan_task_to_chunk(
                 table.clone(),
@@ -121,6 +136,11 @@ impl IcebergScanExecutor {
             ) {
                 let chunk = chunk?;
                 assert_eq!(chunk.data_types(), data_types);
+                tracing::debug!(
+                    "[Iceberg] {} - Yielding chunk with {} rows",
+                    scan_type,
+                    chunk.cardinality()
+                );
                 yield chunk;
             }
         }

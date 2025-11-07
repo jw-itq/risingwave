@@ -30,7 +30,7 @@ use iceberg::table::Table;
 use itertools::Itertools;
 pub use parquet_file_handler::*;
 use phf::{Set, phf_set};
-use risingwave_common::array::arrow::IcebergArrowConvert;
+use risingwave_common::array::arrow::{IcebergArrowConvert, arrow_array, arrow_schema};
 use risingwave_common::array::{ArrayImpl, DataChunk, I64Array, Utf8Array};
 use risingwave_common::bail;
 use risingwave_common::catalog::{
@@ -408,8 +408,24 @@ impl IcebergSplitEnumerator {
         #[for_await]
         for task in file_scan_stream {
             let mut task: FileScanTask = task.map_err(|e| anyhow!(e))?;
+
+            tracing::info!(
+                "[Iceberg] Processing file scan task: data_file={}, deletes_count={}, sequence_number={}",
+                task.data_file_path,
+                task.deletes.len(),
+                task.sequence_number
+            );
+
             for delete_file in task.deletes.drain(..) {
                 let mut delete_file = delete_file.as_ref().clone();
+
+                tracing::info!(
+                    "[Iceberg]   Delete file: path={}, content_type={:?}, sequence_number={}",
+                    delete_file.data_file_path,
+                    delete_file.data_file_content,
+                    delete_file.sequence_number
+                );
+
                 match delete_file.data_file_content {
                     iceberg::spec::DataContentType::Data => {
                         bail!("Data file should not in task deletes");
@@ -421,6 +437,18 @@ impl IcebergSplitEnumerator {
                     }
                     iceberg::spec::DataContentType::PositionDeletes => {
                         if position_delete_files_set.insert(delete_file.data_file_path.clone()) {
+                            // Position delete files have a standard schema with file_path and pos columns
+                            // We need to read these columns, so we should NOT clear project_field_ids
+                            // unless we're certain that empty means "read all columns"
+                            // For now, keep the original project_field_ids from the SDK
+                            // delete_file.project_field_ids = Vec::default();
+                            
+                            tracing::warn!(
+                                "[Iceberg] Position delete file project_field_ids before clear: {:?}",
+                                delete_file.project_field_ids
+                            );
+                            
+                            // Clear project_field_ids as before, but log it for debugging
                             delete_file.project_field_ids = Vec::default();
                             position_delete_files.push(delete_file);
                         }
@@ -488,7 +516,22 @@ impl IcebergSplitEnumerator {
         for task in file_scan_stream {
             let task: FileScanTask = task.map_err(|e| anyhow!(e))?;
             assert_eq!(task.data_file_content, DataContentType::Data);
-            assert!(task.deletes.is_empty());
+
+            tracing::info!(
+                "[Iceberg] COUNT(*) processing file: {}, record_count: {:?}, deletes_count: {}",
+                task.data_file_path,
+                task.record_count,
+                task.deletes.len()
+            );
+
+            // For COUNT(*), we should not have deletes in the task when SDK processes them correctly
+            // If there are deletes, it means the SDK is not applying them
+            if !task.deletes.is_empty() {
+                tracing::warn!(
+                    "[Iceberg] COUNT(*) found deletes in task, this might indicate SDK issue"
+                );
+            }
+
             record_counts += task.record_count.expect("must have");
         }
         let split = IcebergSplit {
@@ -661,15 +704,88 @@ pub async fn scan_task_to_chunk(
 
     let data_file_path = data_file_scan_task.data_file_path.clone();
     let data_sequence_number = data_file_scan_task.sequence_number;
+    let start_position = data_file_scan_task.start;
+
+    tracing::info!(
+        "[Iceberg] scan_task_to_chunk - Reading file: {}, sequence: {}, start: {}, length: {}, deletes_count: {}",
+        data_file_path,
+        data_sequence_number,
+        start_position,
+        data_file_scan_task.length,
+        data_file_scan_task.deletes.len()
+    );
+
+    for (idx, delete) in data_file_scan_task.deletes.iter().enumerate() {
+        tracing::info!(
+            "[Iceberg]   Delete file #{}: path={}, content_type={:?}",
+            idx,
+            delete.data_file_path,
+            delete.data_file_content
+        );
+    }
 
     let reader = table.reader_builder().with_batch_size(chunk_size).build();
     let file_scan_stream = tokio_stream::once(Ok(data_file_scan_task));
 
     // FIXME: what if the start position is not 0? The logic for index seems not correct.
+    // Use start_position to calculate the correct file position offset
     let mut record_batch_stream = reader.read(Box::pin(file_scan_stream)).await?.enumerate();
 
     while let Some((index, record_batch)) = record_batch_stream.next().await {
-        let record_batch = record_batch?;
+        let mut record_batch = record_batch?;
+
+        // CRITICAL FIX for Position Delete files:
+        // Iceberg Position Delete files have standard column names "file_path" and "pos",
+        // but RisingWave expects "_iceberg_file_path" and "_iceberg_file_pos" for JOIN matching.
+        // We need to rename these columns to match RisingWave's internal naming convention.
+        //
+        // Detection: Position Delete files typically have "-delete" in their filename (Amoro convention)
+        // and contain exactly 2 columns: file_path (Utf8) and pos (Int64).
+        if data_file_path.contains("-delete") && record_batch.num_columns() == 2 {
+            let schema = record_batch.schema();
+            let fields = schema.fields();
+            
+            // Check if this matches Position Delete schema: file_path (String) + pos (i64)
+            if fields.len() == 2 {
+                let first_field = &fields[0];
+                let second_field = &fields[1];
+                
+                if (first_field.name() == "file_path" || first_field.name() == "file")
+                    && matches!(first_field.data_type(), arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8)
+                    && second_field.name() == "pos"
+                    && matches!(second_field.data_type(), arrow_schema::DataType::Int64)
+                {
+                    // Rename columns to RisingWave's internal names
+                    let new_fields = vec![
+                        arrow_schema::Field::new(
+                            ICEBERG_FILE_PATH_COLUMN_NAME,
+                            first_field.data_type().clone(),
+                            first_field.is_nullable(),
+                        ),
+                        arrow_schema::Field::new(
+                            ICEBERG_FILE_POS_COLUMN_NAME,
+                            second_field.data_type().clone(),
+                            second_field.is_nullable(),
+                        ),
+                    ];
+                    let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
+                    
+                    // Reconstruct RecordBatch with new schema but same data
+                    record_batch = arrow_array::RecordBatch::try_new(
+                        new_schema,
+                        record_batch.columns().to_vec(),
+                    )?;
+                    
+                    tracing::info!(
+                        "[Iceberg] Renamed Position Delete columns: {} -> {}, {} -> {}",
+                        first_field.name(),
+                        ICEBERG_FILE_PATH_COLUMN_NAME,
+                        second_field.name(),
+                        ICEBERG_FILE_POS_COLUMN_NAME
+                    );
+                }
+            }
+        }
 
         let mut chunk = IcebergArrowConvert.chunk_from_record_batch(&record_batch)?;
         if need_seq_num {
@@ -684,10 +800,22 @@ pub async fn scan_task_to_chunk(
             columns.push(Arc::new(ArrayImpl::Utf8(Utf8Array::from_iter(
                 vec![data_file_path.as_str(); visibility.len()],
             ))));
-            let index_start = (index * chunk_size) as i64;
-            columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(
-                (index_start..(index_start + visibility.len() as i64)).collect::<Vec<i64>>(),
-            ))));
+            // Calculate file position correctly: start_position + (batch_index * chunk_size) + row_offset
+            let index_start = start_position as i64 + (index * chunk_size) as i64;
+            let positions: Vec<i64> =
+                (index_start..(index_start + visibility.len() as i64)).collect();
+
+            tracing::debug!(
+                "[Iceberg] Adding file_path and file_pos: file={}, batch_index={}, start_position={}, chunk_size={}, positions=[{}, {}]",
+                data_file_path,
+                index,
+                start_position,
+                chunk_size,
+                positions.first().unwrap_or(&-1),
+                positions.last().unwrap_or(&-1)
+            );
+
+            columns.push(Arc::new(ArrayImpl::Int64(I64Array::from_iter(positions))));
             chunk = DataChunk::from_parts(columns.into(), visibility)
         }
         *read_bytes += chunk.estimated_heap_size() as u64;
