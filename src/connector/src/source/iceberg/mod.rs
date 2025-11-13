@@ -407,20 +407,25 @@ impl IcebergSplitEnumerator {
 
         #[for_await]
         for task in file_scan_stream {
-            let mut task: FileScanTask = task.map_err(|e| anyhow!(e))?;
-            for delete_file in task.deletes.drain(..) {
-                let mut delete_file = delete_file.as_ref().clone();
+            let task: FileScanTask = task.map_err(|e| anyhow!(e))?;
+            // Collect delete files for separate scans (for JOIN-based filtering in batch queries)
+            // Note: We clone the delete files here instead of draining them, so that the
+            // iceberg-rust reader can still apply position deletes automatically.
+            for delete_file in &task.deletes {
+                let delete_file = delete_file.as_ref().clone();
                 match delete_file.data_file_content {
                     iceberg::spec::DataContentType::Data => {
                         bail!("Data file should not in task deletes");
                     }
                     iceberg::spec::DataContentType::EqualityDeletes => {
                         if equality_delete_files_set.insert(delete_file.data_file_path.clone()) {
+                            let mut delete_file = delete_file;
                             equality_delete_files.push(delete_file);
                         }
                     }
                     iceberg::spec::DataContentType::PositionDeletes => {
                         if position_delete_files_set.insert(delete_file.data_file_path.clone()) {
+                            let mut delete_file = delete_file;
                             delete_file.project_field_ids = Vec::default();
                             position_delete_files.push(delete_file);
                         }
